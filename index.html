@@ -3919,21 +3919,24 @@
           >
             <div
               onClick={(e) => e.stopPropagation()}
-              className="bg-gradient-to-br from-indigo-950 via-slate-900 to-indigo-900 text-white rounded-3xl max-w-4xl w-full p-6 sm:p-10 border-2 border-amber-400/60 shadow-2xl relative"
+              className="bg-gradient-to-br from-indigo-950 via-slate-900 to-indigo-900 text-white rounded-3xl max-w-4xl w-full p-6 sm:p-10 border-2 border-amber-400/60 shadow-2xl space-y-6"
             >
-              <button
-                type="button"
-                onClick={() => setIsQrPosterOpen(false)}
-                className="absolute top-5 right-5 px-4 py-2 rounded-xl bg-white/10 hover:bg-white/20 text-sm font-extrabold flex items-center gap-1.5 cursor-pointer"
-              >
-                <X className="w-4 h-4" /> 關閉海報
-              </button>
+              {/* 獨立頂部列：左側迎賓徽章 ＋ 右側關閉海報按鈕（不再與下方 QR Code 重疊） */}
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-4">
+                <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-400 text-slate-950 text-xs sm:text-sm font-black">
+                  <Smartphone className="w-4 h-4" /> 手機掃碼立即進入課堂思考任務
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsQrPosterOpen(false)}
+                  className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-sm font-extrabold flex items-center gap-1.5 shadow-md cursor-pointer transition"
+                >
+                  <X className="w-4 h-4" /> 關閉海報
+                </button>
+              </div>
 
               <div className="grid grid-cols-1 md:grid-cols-12 gap-8 items-center">
                 <div className="md:col-span-7 space-y-5">
-                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-400 text-slate-950 text-xs font-black">
-                    <Smartphone className="w-4 h-4" /> 手機掃碼立即進入課堂思考任務
-                  </div>
                   <h2 className="text-2xl sm:text-4xl font-black tracking-tight leading-tight">
                     {activeClassroom.title}
                   </h2>
