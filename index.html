@@ -2302,8 +2302,12 @@
       const [sessions, setSessions] = useState(INITIAL_SESSIONS);
       const [activeSessionId, setActiveSessionId] = useState('SES-1001');
 
+      // 加入碼與課堂 QR Code / 大螢幕答案牆狀態
       const [joinCodeInput, setJoinCodeInput] = useState('TONY26');
       const [studentNameInput, setStudentNameInput] = useState('');
+      const [isQrStudentMode, setIsQrStudentMode] = useState(false);
+      const [qrStudentCheckedIn, setQrStudentCheckedIn] = useState(false);
+      const [qrMobileDrawer, setQrMobileDrawer] = useState('none'); // 'none' | 'story' | 'hint'
       const [isQrPosterOpen, setIsQrPosterOpen] = useState(false);
       const [isLiveWallOpen, setIsLiveWallOpen] = useState(false);
       const [liveWallStageFilter, setLiveWallStageFilter] = useState('ALL');
@@ -2341,12 +2345,113 @@
         setTimeout(() => setToast(null), 4000);
       };
 
+      // 1. 監聽 Firestore classrooms 與 sessions 集合，實現「老師電腦 × 學員手機」跨裝置即時同步
+      useEffect(() => {
+        let unsubClassrooms = null;
+        let unsubSessions = null;
+        try {
+          unsubClassrooms = onSnapshot(
+            collection(db, 'classrooms'),
+            (snap) => {
+              if (!snap.empty) {
+                const cloudClasses = snap.docs.map((d) => d.data());
+                setClassrooms((prev) => {
+                  const map = new Map();
+                  prev.forEach((c) => map.set(c.joinCode.toUpperCase(), c));
+                  cloudClasses.forEach((c) => {
+                    if (c && c.joinCode) {
+                      map.set(c.joinCode.toUpperCase(), c);
+                    }
+                  });
+                  return Array.from(map.values());
+                });
+              }
+            },
+            () => {}
+          );
+
+          unsubSessions = onSnapshot(
+            collection(db, 'sessions'),
+            (snap) => {
+              if (!snap.empty) {
+                const cloudSessions = snap.docs.map((d) => d.data());
+                setSessions((prev) => {
+                  const map = new Map();
+                  prev.forEach((s) => map.set(s.id, s));
+                  cloudSessions.forEach((s) => {
+                    if (s && s.id) {
+                      map.set(s.id, s);
+                    }
+                  });
+                  return Array.from(map.values());
+                });
+              }
+            },
+            () => {}
+          );
+        } catch (err) {
+          // ignore
+        }
+        return () => {
+          if (unsubClassrooms) unsubClassrooms();
+          if (unsubSessions) unsubSessions();
+        };
+      }, []);
+
+      // 2. 手機掃描 QR Code 進入時，自動啟動「📱 學員掃碼專屬極簡互動模式 (isQrStudentMode)」並綁定老師課堂
       useEffect(() => {
         if (typeof window !== 'undefined') {
           const params = new URLSearchParams(window.location.search);
           const joinParam = params.get('join');
+          const titleParam = params.get('title');
+          const scParam = params.get('sc');
+          const demoParam = params.get('demo');
+          const stageParam = params.get('stage');
+
           if (joinParam) {
-            setJoinCodeInput(joinParam.toUpperCase());
+            const cleanCode = joinParam.trim().toUpperCase();
+            setJoinCodeInput(cleanCode);
+            setRole('student');
+            setIsQrStudentMode(true);
+
+            const targetId = `CLS-QR-${cleanCode}`;
+            setClassrooms((prev) => {
+              const existing = prev.find((c) => c.joinCode.toUpperCase() === cleanCode);
+              if (existing) {
+                setActiveClassId(existing.id);
+                return prev.map((c) =>
+                  c.joinCode.toUpperCase() === cleanCode
+                    ? {
+                        ...c,
+                        title: titleParam || c.title,
+                        scenarioId: scParam || c.scenarioId,
+                        activeBroadcastStage: stageParam || c.activeBroadcastStage || 'G0'
+                      }
+                    : c
+                );
+              }
+              const qrInjectedClass = {
+                id: targetId,
+                teacherId: 'teacher-1',
+                title: titleParam || `課堂實戰演練 (${cleanCode})`,
+                joinCode: cleanCode,
+                joinExpiresAt: '2026-12-31 23:59',
+                status: 'active',
+                scenarioId: scParam || 'SC02',
+                allowAiDemo: demoParam !== '0',
+                pacingMode: 'teacher_sync',
+                activeBroadcastStage: stageParam || 'G0',
+                tokenBudget: 120000,
+                tokensUsed: 0,
+                studentCount: 1
+              };
+              setActiveClassId(targetId);
+              return [qrInjectedClass, ...prev];
+            });
+
+            if (stageParam) {
+              setSelectedStageId(stageParam);
+            }
           }
         }
       }, []);
@@ -2424,7 +2529,7 @@
       );
 
       const activeScenario = useMemo(() => {
-        const scenId = activeSession?.scenarioId || activeClassroom?.scenarioId || 'SC01';
+        const scenId = activeClassroom?.scenarioId || activeSession?.scenarioId || 'SC01';
         return scenarios.find((sc) => sc.id === scenId) || scenarios[0];
       }, [scenarios, activeSession, activeClassroom]);
 
@@ -2432,15 +2537,6 @@
         () => STAGES.find((st) => st.id === selectedStageId) || STAGES[0],
         [selectedStageId]
       );
-
-      useEffect(() => {
-        if (!activeSession) return;
-        const existing = activeSession.responses?.[selectedStageId];
-        setDraftResponse(existing?.content || '');
-        setCurrentAssistance(existing?.assistanceLevel || 'self');
-        setShowHintBox(false);
-        setShowDemoBox(false);
-      }, [selectedStageId, activeSessionId]);
 
       useEffect(() => {
         if (
@@ -2452,17 +2548,21 @@
         }
       }, [activeClassroom?.pacingMode, activeClassroom?.activeBroadcastStage, role]);
 
-      const handleSetClassroomStage = (targetStageId) => {
+      const handleSetClassroomStage = async (targetStageId) => {
         if (!activeClassroom) return;
+        const updatedClass = { ...activeClassroom, activeBroadcastStage: targetStageId };
         setClassrooms((prev) =>
-          prev.map((c) =>
-            c.id === activeClassroom.id
-              ? { ...c, activeBroadcastStage: targetStageId }
-              : c
-          )
+          prev.map((c) => (c.id === activeClassroom.id ? updatedClass : c))
         );
         setSelectedStageId(targetStageId);
         setLiveWallStageFilter(targetStageId);
+        try {
+          await setDoc(doc(db, 'classrooms', updatedClass.joinCode.toUpperCase()), updatedClass, {
+            merge: true
+          });
+        } catch (e) {
+          // ignore
+        }
         const stageObj = STAGES.find((s) => s.id === targetStageId);
         showToast(
           `📡 已向全班手機推播同步指令：請全班進入【${stageObj?.name || targetStageId}】！`,
@@ -2470,13 +2570,19 @@
         );
       };
 
-      const handleTogglePacingMode = (nextMode) => {
+      const handleTogglePacingMode = async (nextMode) => {
         if (!activeClassroom) return;
+        const updatedClass = { ...activeClassroom, pacingMode: nextMode };
         setClassrooms((prev) =>
-          prev.map((c) =>
-            c.id === activeClassroom.id ? { ...c, pacingMode: nextMode } : c
-          )
+          prev.map((c) => (c.id === activeClassroom.id ? updatedClass : c))
         );
+        try {
+          await setDoc(doc(db, 'classrooms', updatedClass.joinCode.toUpperCase()), updatedClass, {
+            merge: true
+          });
+        } catch (e) {
+          // ignore
+        }
         showToast(
           nextMode === 'teacher_sync'
             ? '📡 已切換為【跟隨老師大螢幕同步引導模式】：全班手機將鎖定在老師指定的關卡！'
@@ -2709,29 +2815,35 @@
         setCurrentAssistance('demo');
       };
 
-      const handleSaveDraft = () => {
+      const handleSaveDraft = async () => {
         if (!activeSession) return;
         const nowTime = new Date().toTimeString().slice(0, 5);
+        const prevRev = activeSession.responses?.[selectedStageId]?.revision || 0;
+        const updatedSession = {
+          ...activeSession,
+          studentName: studentNameInput.trim() || activeSession.studentName,
+          classId: activeClassroom?.id || activeSession.classId,
+          scenarioId: activeScenario?.id || activeSession.scenarioId,
+          uiState: 'saved',
+          responses: {
+            ...activeSession.responses,
+            [selectedStageId]: {
+              content: draftResponse,
+              revision: prevRev + 1,
+              assistanceLevel: currentAssistance,
+              submittedAt: nowTime,
+              passed: activeSession.responses?.[selectedStageId]?.passed || false
+            }
+          }
+        };
         setSessions((prev) =>
-          prev.map((s) => {
-            if (s.id !== activeSession.id) return s;
-            const prevRev = s.responses?.[selectedStageId]?.revision || 0;
-            return {
-              ...s,
-              uiState: 'saved',
-              responses: {
-                ...s.responses,
-                [selectedStageId]: {
-                  content: draftResponse,
-                  revision: prevRev + 1,
-                  assistanceLevel: currentAssistance,
-                  submittedAt: nowTime,
-                  passed: s.responses?.[selectedStageId]?.passed || false
-                }
-              }
-            };
-          })
+          prev.map((s) => (s.id === activeSession.id ? updatedSession : s))
         );
+        try {
+          await setDoc(doc(db, 'sessions', updatedSession.id), updatedSession, { merge: true });
+        } catch (e) {
+          // ignore
+        }
         showToast(`已自動儲存 ${selectedStageId} 作答草稿並同步至課堂答案牆！`, 'success');
       };
 
@@ -2792,6 +2904,7 @@
         const nextStageObj = STAGES[Math.min(currentIdx + 1, STAGES.length - 1)];
         const nowTime = new Date().toTimeString().slice(0, 5);
 
+        let updatedSessionForCloud = null;
         setSessions((prev) =>
           prev.map((s) => {
             if (s.id !== activeSession.id) return s;
@@ -2800,7 +2913,7 @@
             const nextCurrentStage =
               passedHeuristic && currentIdx >= currentOrder ? nextStageObj.id : s.currentStage;
 
-            return {
+            const updated = {
               ...s,
               currentStage: nextCurrentStage,
               status: selectedStageId === 'G6' && passedHeuristic ? 'completed' : s.status,
@@ -2839,8 +2952,20 @@
                 }
               }
             };
+            updatedSessionForCloud = updated;
+            return updated;
           })
         );
+
+        if (updatedSessionForCloud) {
+          try {
+            await setDoc(doc(db, 'sessions', updatedSessionForCloud.id), updatedSessionForCloud, {
+              merge: true
+            });
+          } catch (e) {
+            // ignore
+          }
+        }
 
         if (passedHeuristic) {
           if (selectedStageId === 'G6') {
@@ -3533,7 +3658,18 @@
 
       const renderQrPosterModal = () => {
         if (!isQrPosterOpen || !activeClassroom) return null;
-        const joinUrl = `${typeof window !== 'undefined' ? window.location.origin + window.location.pathname : 'https://k41-tony-thinking-lab.web.app'}/?join=${activeClassroom.joinCode}`;
+        const baseUrl =
+          typeof window !== 'undefined'
+            ? window.location.origin + window.location.pathname
+            : 'https://mindnodeai.github.io/';
+        const qrQuery = new URLSearchParams({
+          join: activeClassroom.joinCode,
+          title: activeClassroom.title,
+          sc: activeClassroom.scenarioId || 'SC01',
+          demo: activeClassroom.allowAiDemo ? '1' : '0',
+          stage: activeClassroom.activeBroadcastStage || 'G0'
+        }).toString();
+        const joinUrl = `${baseUrl}?${qrQuery}`;
         const qrImgSrc = `https://api.qrserver.com/v1/create-qr-code/?size=360x360&margin=12&data=${encodeURIComponent(joinUrl)}`;
 
         return (
@@ -3994,22 +4130,122 @@
                 <div className="md:col-span-4">
                   <button
                     type="button"
-                    onClick={() => {
-                      const foundCls = classrooms.find(
-                        (c) => c.joinCode.toUpperCase() === joinCodeInput.trim().toUpperCase()
-                      );
-                      if (!foundCls) {
-                        showToast('找不到此課堂加入碼，請確認是否為 TONY26 或 LEAD88', 'error');
+                    onClick={async () => {
+                      const cleanCode = joinCodeInput.trim().toUpperCase();
+                      if (!cleanCode) {
+                        showToast('請輸入課堂加入碼！', 'error');
                         return;
                       }
+
+                      let foundCls = classrooms.find(
+                        (c) => c.joinCode.toUpperCase() === cleanCode
+                      );
+
+                      if (!foundCls) {
+                        try {
+                          const docRef = doc(db, 'classrooms', cleanCode);
+                          const snap = await getDoc(docRef);
+                          if (snap.exists()) {
+                            foundCls = snap.data();
+                            setClassrooms((prev) => [foundCls, ...prev]);
+                          }
+                        } catch (e) {
+                          // ignore
+                        }
+                      }
+
+                      if (!foundCls) {
+                        foundCls = {
+                          id: `CLS-${cleanCode}`,
+                          teacherId: 'teacher-1',
+                          title: `企業實戰課堂 (${cleanCode})`,
+                          joinCode: cleanCode,
+                          joinExpiresAt: '2026-12-31 23:59',
+                          status: 'active',
+                          scenarioId: activeClassroom?.scenarioId || 'SC02',
+                          allowAiDemo: true,
+                          pacingMode: 'teacher_sync',
+                          activeBroadcastStage: 'G0',
+                          tokenBudget: 120000,
+                          tokensUsed: 0,
+                          studentCount: 1
+                        };
+                        setClassrooms((prev) => [foundCls, ...prev]);
+                      }
+
+                      const finalStudentName =
+                        studentNameInput.trim() || currentUser?.realName || '課堂學員';
+                      const mySessionId = `SES-${cleanCode}-${(currentUser?.uid || finalStudentName)
+                        .replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '')
+                        .slice(0, 10)}`;
+
+                      const existingMySession = sessions.find((s) => s.id === mySessionId);
+                      const targetSession = existingMySession
+                        ? {
+                            ...existingMySession,
+                            classId: foundCls.id,
+                            scenarioId: foundCls.scenarioId,
+                            studentName: finalStudentName
+                          }
+                        : {
+                            id: mySessionId,
+                            classId: foundCls.id,
+                            assignmentId: 'ASG-LIVE',
+                            scenarioId: foundCls.scenarioId,
+                            studentId: currentUser?.uid || `stu-${Date.now()}`,
+                            studentName: finalStudentName,
+                            currentStage: foundCls.activeBroadcastStage || 'G0',
+                            status: 'in_progress',
+                            uiState: 'saved',
+                            startedAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
+                            finishedAt: null,
+                            checkedFacts: [0, 1],
+                            checkedUnknowns: [0],
+                            responses: {},
+                            feedback: {},
+                            assessment: {
+                              rubricVersion: 'rubric-1.0',
+                              modelId: 'gemini-2.5-flash',
+                              reviewStatus: 'pending_review',
+                              scores: {
+                                assumption: 1,
+                                perspective: 1,
+                                method: 1,
+                                evidence: 1,
+                                habit: 1,
+                                metacognition: 1
+                              },
+                              evidence: [],
+                              actionPlan: '進行中'
+                            }
+                          };
+
+                      setSessions((prev) => {
+                        const filtered = prev.filter((s) => s.id !== mySessionId);
+                        return [targetSession, ...filtered];
+                      });
                       setActiveClassId(foundCls.id);
+                      setActiveSessionId(mySessionId);
                       setSelectedStageId(foundCls.activeBroadcastStage || 'G0');
-                      setActiveView('learn');
-                      showToast(`已成功進入「${foundCls.title}」！現在開始第 2 步 G0–G6 闖關。`, 'success');
+                      setIsQrStudentMode(true);
+                      setQrStudentCheckedIn(true);
+
+                      try {
+                        await setDoc(doc(db, 'sessions', mySessionId), targetSession, {
+                          merge: true
+                        });
+                      } catch (e) {
+                        // ignore
+                      }
+
+                      showToast(
+                        `🎉 已進入「${foundCls.title}」專屬手機互動模式！`,
+                        'success'
+                      );
                     }}
                     className="w-full py-3.5 px-6 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-base flex items-center justify-center gap-2 shadow-md cursor-pointer"
                   >
-                    <span>確認加入課堂 ➔ 前往第 2 步闖關</span>
+                    <span>確認加入課堂 ➔ 進入專屬互動模式</span>
                     <ArrowRight className="w-5 h-5" />
                   </button>
                 </div>
@@ -4115,6 +4351,11 @@
                         <button
                           type="button"
                           onClick={() => {
+                            setClassrooms((prev) =>
+                              prev.map((c) =>
+                                c.id === activeClassroom.id ? { ...c, scenarioId: sc.id } : c
+                              )
+                            );
                             setSessions((prev) =>
                               prev.map((s) =>
                                 s.id === activeSession.id
@@ -4776,6 +5017,16 @@
               </button>
               <button
                 type="button"
+                onClick={() => {
+                  setIsQrStudentMode(true);
+                  setQrStudentCheckedIn(true);
+                }}
+                className="px-4 py-2.5 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 text-sm font-extrabold flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <Smartphone className="w-4 h-4" /> 預覽學員手機極簡畫面
+              </button>
+              <button
+                type="button"
                 onClick={handleExportClassCsv}
                 className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-extrabold flex items-center gap-1.5 cursor-pointer shadow-xs"
               >
@@ -4880,15 +5131,15 @@
               <div className="md:col-span-3">
                 <button
                   type="button"
-                  onClick={() => {
+                  onClick={async () => {
                     if (!newClassTitle.trim()) {
                       showToast('請輸入課堂名稱', 'error');
                       return;
                     }
                     const code = 'TL' + Math.floor(1000 + Math.random() * 9000);
                     const newCls = {
-                      id: `CLS-${Date.now()}`,
-                      teacherId: 'teacher-1',
+                      id: `CLS-${code}`,
+                      teacherId: currentUser?.uid || 'teacher-1',
                       title: newClassTitle.trim(),
                       joinCode: code,
                       joinExpiresAt: '2026-12-31 23:59',
@@ -4904,7 +5155,16 @@
                     setClassrooms((prev) => [newCls, ...prev]);
                     setActiveClassId(newCls.id);
                     setNewClassTitle('');
-                    showToast(`已建立新課堂！專屬加入碼為 ${code}`, 'success');
+                    try {
+                      await setDoc(doc(db, 'classrooms', code), newCls);
+                    } catch (e) {
+                      // ignore
+                    }
+                    setIsQrPosterOpen(true);
+                    showToast(
+                      `已建立新課堂「${newCls.title}」！專屬加入碼為 ${code}，已為您彈出掃碼海報。`,
+                      'success'
+                    );
                   }}
                   className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-sm cursor-pointer"
                 >
@@ -5465,6 +5725,483 @@
           : fontScale === 'xlarge'
           ? { zoom: 1.18 }
           : { zoom: 1.0 };
+
+      // ============================================================================
+      // 13.8 📱 學員掃描 QR Code 專屬極簡課堂互動模式（免複雜選單、直接對應老師當前課程與關卡）
+      // ============================================================================
+
+      const handleQrStudentCheckIn = async (e) => {
+        if (e) e.preventDefault();
+        const cleanCode = (joinCodeInput || activeClassroom?.joinCode || 'TONY26')
+          .trim()
+          .toUpperCase();
+        const finalName =
+          studentNameInput.trim() || currentUser?.realName || '現場學員';
+
+        if (!studentNameInput.trim() && !currentUser?.realName) {
+          showToast('請輸入您的姓名或組別代號！', 'error');
+          return;
+        }
+
+        let targetCls =
+          classrooms.find((c) => c.joinCode.toUpperCase() === cleanCode) ||
+          activeClassroom;
+
+        try {
+          const snap = await getDoc(doc(db, 'classrooms', cleanCode));
+          if (snap.exists()) {
+            targetCls = snap.data();
+            setClassrooms((prev) => {
+              const map = new Map();
+              prev.forEach((c) => map.set(c.joinCode.toUpperCase(), c));
+              map.set(cleanCode, targetCls);
+              return Array.from(map.values());
+            });
+          }
+        } catch (err) {
+          // ignore
+        }
+
+        const mySessionId = `SES-${cleanCode}-${finalName
+          .replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '')
+          .slice(0, 12)}`;
+
+        const existingMySession = sessions.find((s) => s.id === mySessionId);
+        const newStuSession = existingMySession
+          ? {
+              ...existingMySession,
+              classId: targetCls.id,
+              scenarioId: targetCls.scenarioId,
+              studentName: finalName
+            }
+          : {
+              id: mySessionId,
+              classId: targetCls.id,
+              assignmentId: 'ASG-QR-LIVE',
+              scenarioId: targetCls.scenarioId || 'SC02',
+              studentId: currentUser?.uid || `qr-${Date.now()}`,
+              studentName: finalName,
+              currentStage: targetCls.activeBroadcastStage || 'G0',
+              status: 'in_progress',
+              uiState: 'saved',
+              startedAt: new Date().toISOString().replace('T', ' ').slice(0, 16),
+              finishedAt: null,
+              checkedFacts: [0, 1],
+              checkedUnknowns: [0],
+              responses: {},
+              feedback: {},
+              assessment: {
+                rubricVersion: 'rubric-1.0',
+                modelId: 'gemini-2.5-flash',
+                reviewStatus: 'pending_review',
+                scores: {
+                  assumption: 2,
+                  perspective: 2,
+                  method: 2,
+                  evidence: 2,
+                  habit: 2,
+                  metacognition: 2
+                },
+                evidence: [],
+                actionPlan: '課堂即時互動中'
+              }
+            };
+
+        setSessions((prev) => {
+          const rest = prev.filter((s) => s.id !== mySessionId);
+          return [newStuSession, ...rest];
+        });
+        setActiveClassId(targetCls.id);
+        setActiveSessionId(mySessionId);
+        setSelectedStageId(targetCls.activeBroadcastStage || 'G0');
+        setStudentNameInput(finalName);
+        setQrStudentCheckedIn(true);
+
+        if (!currentUser) {
+          setCurrentUser({
+            uid: newStuSession.studentId,
+            email: `${mySessionId.toLowerCase()}@classroom.live`,
+            realName: finalName,
+            role: 'user',
+            isSystemCreator: false,
+            memberIdentity: 'TONY老師學員'
+          });
+        }
+
+        try {
+          await setDoc(doc(db, 'sessions', mySessionId), newStuSession, {
+            merge: true
+          });
+        } catch (err) {
+          // ignore
+        }
+
+        showToast(`🎉 歡迎 ${finalName}！已連線進入「${targetCls.title}」`, 'success');
+      };
+
+      if (isQrStudentMode) {
+        const broadcastStageId = activeClassroom?.activeBroadcastStage || 'G0';
+        const isTeacherSync = activeClassroom?.pacingMode === 'teacher_sync';
+        const effectiveStageId = isTeacherSync ? broadcastStageId : selectedStageId;
+        const stageInfo =
+          STAGES.find((s) => s.id === effectiveStageId) || STAGES[0];
+        const mySubmittedResp = activeSession?.responses?.[effectiveStageId];
+        const codexInfo =
+          KNOWLEDGE_CODEX.find((k) => k.stageId === effectiveStageId) ||
+          KNOWLEDGE_CODEX[0];
+
+        return (
+          <div
+            style={zoomStyle}
+            className="min-h-screen bg-slate-950 text-slate-900 flex flex-col justify-between"
+          >
+            {renderKnowledgeCodexModal()}
+
+            {toast && (
+              <div className="fixed bottom-4 left-4 right-4 sm:left-auto sm:right-5 z-50 max-w-md bg-slate-900 text-white px-4 py-3 rounded-2xl shadow-2xl border-2 border-amber-400 flex items-center gap-2 text-sm font-extrabold">
+                <Sparkles className="w-5 h-5 text-amber-400 shrink-0" />
+                <span>{toast.msg}</span>
+              </div>
+            )}
+
+            {/* 極簡手機頂部課堂專屬狀態列（無多餘按鈕） */}
+            <header className="bg-gradient-to-r from-indigo-950 via-slate-900 to-indigo-950 text-white px-4 py-3 border-b border-indigo-500/40 sticky top-0 z-40">
+              <div className="max-w-2xl mx-auto flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <img
+                    src={BRAND_LOGO_URL}
+                    alt="Logo"
+                    className="w-8 h-8 rounded-lg bg-white p-0.5 shrink-0"
+                  />
+                  <div className="truncate">
+                    <div className="flex items-center gap-1.5">
+                      <span className="px-2 py-0.5 rounded bg-amber-400 text-slate-950 text-[11px] font-black font-mono">
+                        {activeClassroom?.joinCode}
+                      </span>
+                      <span className="font-black text-sm sm:text-base truncate">
+                        {activeClassroom?.title}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-indigo-200 truncate">
+                      情境：{activeScenario?.title}
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setIsQrStudentMode(false)}
+                  className="px-2.5 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[11px] text-slate-300 font-bold shrink-0 cursor-pointer"
+                >
+                  切換完整版
+                </button>
+              </div>
+            </header>
+
+            {/* 尚未報到姓名時：一鍵極簡報到卡 */}
+            {!qrStudentCheckedIn ? (
+              <main className="flex-1 flex items-center justify-center p-4">
+                <div className="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl border-2 border-amber-400 space-y-6">
+                  <div className="text-center space-y-2">
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-100 text-indigo-950 text-xs font-black">
+                      <Radio className="w-3.5 h-3.5 text-indigo-600 animate-pulse" />
+                      已掃碼連入老師指定課堂
+                    </span>
+                    <h1 className="text-2xl font-black text-slate-900">
+                      {activeClassroom?.title}
+                    </h1>
+                    <div className="p-3.5 rounded-2xl bg-indigo-50 border border-indigo-200 text-left space-y-1">
+                      <div className="text-xs font-bold text-indigo-700">
+                        📌 本堂互動演練情境：
+                      </div>
+                      <div className="text-base font-extrabold text-slate-900">
+                        {activeScenario?.title}
+                      </div>
+                    </div>
+                  </div>
+
+                  <form onSubmit={handleQrStudentCheckIn} className="space-y-4">
+                    <div>
+                      <label className="block text-sm font-extrabold text-slate-800 mb-1.5">
+                        請輸入您的姓名或組別（將顯示於老師課堂名單）
+                      </label>
+                      <input
+                        type="text"
+                        required
+                        value={studentNameInput}
+                        onChange={(e) => setStudentNameInput(e.target.value)}
+                        placeholder="例如：第 3 組 - 王小明"
+                        className="w-full px-4 py-3.5 rounded-2xl border-2 border-slate-300 focus:border-indigo-600 focus:outline-none text-base font-extrabold"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      className="w-full py-4 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-black text-base sm:text-lg shadow-lg flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <span>🚀 立即進入課堂同步作答</span>
+                      <ArrowRight className="w-5 h-5" />
+                    </button>
+                  </form>
+                </div>
+              </main>
+            ) : (
+              /* 已報到後：手機專屬極簡同步作答器 */
+              <main className="max-w-2xl w-full mx-auto px-3 sm:px-4 py-4 flex-1 space-y-4">
+                {/* 1. 老師大螢幕當前同步關卡指示牌 */}
+                <div className="bg-gradient-to-r from-amber-400 via-amber-300 to-amber-400 text-slate-950 rounded-2xl p-4 shadow-md flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5">
+                    <span className="w-9 h-9 rounded-xl bg-slate-950 text-amber-400 font-black text-sm flex items-center justify-center shrink-0">
+                      {stageInfo.id}
+                    </span>
+                    <div>
+                      <div className="text-[11px] font-black uppercase tracking-wider flex items-center gap-1">
+                        <Radio className="w-3.5 h-3.5 animate-pulse text-rose-700" />
+                        <span>老師大螢幕目前引導關卡</span>
+                      </div>
+                      <div className="text-lg font-black leading-tight">
+                        {stageInfo.name}（{stageInfo.dimension}）
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="text-xs font-extrabold bg-white/80 px-3 py-1 rounded-full">
+                    學員：{studentNameInput || currentUser?.realName}
+                  </div>
+                </div>
+
+                {/* 若老師開放自由切換關卡，或學員想回看前幾關，提供簡潔關卡點選條 */}
+                <div className="grid grid-cols-7 gap-1 bg-slate-900 p-1.5 rounded-2xl border border-slate-800">
+                  {STAGES.map((st, idx) => {
+                    const broadcastIdx = STAGES.findIndex((s) => s.id === broadcastStageId);
+                    const canClick = !isTeacherSync || idx <= broadcastIdx;
+                    const isCurr = effectiveStageId === st.id;
+                    const isDone = activeSession?.responses?.[st.id]?.passed;
+                    return (
+                      <button
+                        key={st.id}
+                        type="button"
+                        disabled={!canClick}
+                        onClick={() => setSelectedStageId(st.id)}
+                        className={`py-2 rounded-xl text-center transition cursor-pointer disabled:opacity-35 ${
+                          isCurr
+                            ? 'bg-amber-400 text-slate-950 font-black shadow-xs'
+                            : isDone
+                            ? 'bg-emerald-900/70 text-emerald-200 font-bold'
+                            : 'text-slate-400 hover:text-white font-bold'
+                        }`}
+                      >
+                        <div className="text-xs">{st.id}</div>
+                        <div className="text-[10px] truncate px-0.5">{st.shortName}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* 2. 三顆極簡隨身小抄按鈕：放大看關係圖 / 展開讀情境故事 / 看造句模板 */}
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDiagramFullscreenTrigger((c) => c + 1)}
+                    className="p-3 rounded-2xl bg-indigo-900 hover:bg-indigo-800 text-white border border-indigo-500/40 flex flex-col items-center justify-center gap-1 text-center cursor-pointer shadow-xs"
+                  >
+                    <Maximize2 className="w-4 h-4 text-amber-400" />
+                    <span className="text-xs font-extrabold">🔍 放大看關係圖</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setQrMobileDrawer((prev) => (prev === 'story' ? 'none' : 'story'))
+                    }
+                    className={`p-3 rounded-2xl border flex flex-col items-center justify-center gap-1 text-center cursor-pointer shadow-xs ${
+                      qrMobileDrawer === 'story'
+                        ? 'bg-amber-400 text-slate-950 border-amber-300 font-black'
+                        : 'bg-slate-900 text-white border-slate-700 font-extrabold'
+                    }`}
+                  >
+                    <BookOpen className="w-4 h-4 text-amber-400" />
+                    <span className="text-xs">
+                      {qrMobileDrawer === 'story' ? '▲ 收合情境故事' : '📖 讀情境與事實'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setQrMobileDrawer((prev) => (prev === 'hint' ? 'none' : 'hint'))
+                    }
+                    className={`p-3 rounded-2xl border flex flex-col items-center justify-center gap-1 text-center cursor-pointer shadow-xs ${
+                      qrMobileDrawer === 'hint'
+                        ? 'bg-emerald-400 text-slate-950 border-emerald-300 font-black'
+                        : 'bg-slate-900 text-white border-slate-700 font-extrabold'
+                    }`}
+                  >
+                    <Lightbulb className="w-4 h-4 text-emerald-400" />
+                    <span className="text-xs">
+                      {qrMobileDrawer === 'hint' ? '▲ 收合提示模板' : '💡 看提示與模板'}
+                    </span>
+                  </button>
+                </div>
+
+                {/* 隱藏掛載 MermaidDiagramCard 以支援全螢幕關係圖彈窗 */}
+                <div className="hidden">
+                  <MermaidDiagramCard
+                    scenario={activeScenario}
+                    externalFullscreenTrigger={diagramFullscreenTrigger}
+                  />
+                </div>
+
+                {/* 摺疊抽屜 A：情境故事與已知事實/未知 */}
+                {qrMobileDrawer === 'story' && (
+                  <div className="bg-white rounded-3xl p-5 border-2 border-amber-400 space-y-4 shadow-xl">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                      <h3 className="font-black text-base text-slate-900">
+                        📖 {activeScenario?.title}
+                      </h3>
+                      <button
+                        type="button"
+                        onClick={() => setQrMobileDrawer('none')}
+                        className="text-xs font-bold text-slate-500 px-2 py-1 rounded bg-slate-100"
+                      >
+                        收合
+                      </button>
+                    </div>
+                    <FormattedStoryBlock
+                      story={activeScenario?.story}
+                      fontSizeLevel="medium"
+                      boldHighlight={true}
+                    />
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 text-xs">
+                      <div className="bg-emerald-50 p-3 rounded-xl border border-emerald-200 space-y-1">
+                        <div className="font-extrabold text-emerald-900">✅ 已知事實 (Facts)：</div>
+                        <ul className="list-disc list-inside text-slate-700 space-y-1">
+                          {(activeScenario?.facts || []).map((f, i) => (
+                            <li key={i}>{f}</li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div className="bg-amber-50 p-3 rounded-xl border border-amber-200 space-y-1">
+                        <div className="font-extrabold text-amber-900">❓ 待查未知 (Unknowns)：</div>
+                        <ul className="list-disc list-inside text-slate-700 space-y-1">
+                          {(activeScenario?.unknowns || []).map((u, i) => (
+                            <li key={i}>{u}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* 摺疊抽屜 B：本關提示與萬用填空造句模板 */}
+                {qrMobileDrawer === 'hint' && (
+                  <div className="bg-white rounded-3xl p-5 border-2 border-emerald-400 space-y-3 shadow-xl">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-black text-emerald-800 bg-emerald-100 px-2.5 py-1 rounded-full">
+                        💡 {stageInfo.id} 思考提示與造句模板
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveCodexStageId(effectiveStageId);
+                          setIsKnowledgeCodexOpen(true);
+                        }}
+                        className="text-xs font-extrabold text-indigo-700 underline cursor-pointer"
+                      >
+                        📚 打開完整理論寶典
+                      </button>
+                    </div>
+                    <p className="text-sm text-slate-700 font-medium">{stageInfo.hint}</p>
+                    <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 space-y-2">
+                      <div className="text-xs font-black text-amber-950">
+                        ✍️ 萬用填空模板（點擊下方按鈕可直接帶入作答框）：
+                      </div>
+                      <p className="text-xs sm:text-sm text-slate-800 font-bold leading-relaxed">
+                        {codexInfo.formulaTemplate}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDraftResponse(codexInfo.formulaTemplate);
+                          setCurrentAssistance('hint');
+                          setQrMobileDrawer('none');
+                          showToast('已帶入思考造句模板，請填入您的具體觀察！', 'success');
+                        }}
+                        className="w-full py-2 rounded-xl bg-indigo-600 text-white text-xs font-extrabold cursor-pointer"
+                      >
+                        ＋ 一鍵將模板帶入下方作答框
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* 3. 核心互動卡片：老師本關提問 ＋ 手機直接打字投遞到大螢幕 */}
+                <div className="bg-white rounded-3xl p-5 sm:p-6 border-2 border-indigo-200 shadow-xl space-y-4">
+                  <div className="bg-indigo-950 text-white rounded-2xl p-4 space-y-1.5">
+                    <div className="text-xs font-black text-amber-400 flex items-center gap-1.5">
+                      <Brain className="w-4 h-4" />
+                      <span>本關核心提問（您的回答將同步至講台大螢幕）</span>
+                    </div>
+                    <p className="text-base sm:text-lg font-extrabold leading-snug">
+                      {stageInfo.coachQuestion}
+                    </p>
+                    <p className="text-xs text-indigo-200 pt-1">
+                      任務要求：{stageInfo.task}
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-extrabold text-slate-800">
+                        ✍️ 請輸入您對【{stageInfo.name}】的觀點：
+                      </label>
+                      {mySubmittedResp && (
+                        <span className="text-xs font-extrabold text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full border border-emerald-300">
+                          ✅ 已投遞至大螢幕 ({mySubmittedResp.submittedAt})
+                        </span>
+                      )}
+                    </div>
+
+                    <textarea
+                      value={draftResponse}
+                      onChange={(e) => setDraftResponse(e.target.value)}
+                      rows={5}
+                      placeholder={`請在此輸入您的想法（不知道怎麼寫可點上方「💡 看提示與模板」）...`}
+                      className="w-full p-4 rounded-2xl border-2 border-slate-300 focus:border-indigo-600 focus:outline-none text-base leading-relaxed font-medium"
+                    />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleSubmitStageResponse}
+                    className="w-full py-4 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-black text-base sm:text-lg shadow-lg flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <Send className="w-5 h-5" />
+                    <span>
+                      {mySubmittedResp
+                        ? `🔄 更新並重新投遞 ${stageInfo.id} 回答至大螢幕`
+                        : `🚀 送出 ${stageInfo.id} 回答至老師大螢幕`}
+                    </span>
+                  </button>
+
+                  {mySubmittedResp && (
+                    <div className="p-3.5 rounded-2xl bg-emerald-50 border-2 border-emerald-300 text-emerald-950 text-xs sm:text-sm font-bold flex items-center gap-2">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                      <span>
+                        您的回答已成功投遞到老師的「課堂大螢幕互動答案牆」！請抬頭觀看大螢幕討論，當老師切換下一關時，您的手機畫面將自動更新。
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </main>
+            )}
+
+            <footer className="bg-slate-900 border-t border-slate-800 py-3 px-4 text-center text-[11px] text-slate-400">
+              © 2020 TonyStudio. TONY Thinking Lab 課堂即時互動系統
+            </footer>
+          </div>
+        );
+      }
 
       if (!currentUser) {
         return (
